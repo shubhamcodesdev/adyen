@@ -375,7 +375,7 @@ def _label(status, code=""):
     if status in ("ORDER_STATUS_APPROVED","approved","ORDER_STATUS_SETTLE_OK","settle_ok","settled"):
         return "✅ APPROVED"
     if status in ("ORDER_STATUS_AUTH_OK", "auth_ok"):
-        return "⚡ LIVE [AUTH OK]"
+        return "✅ APPROVED [AUTH OK]"
     if code == "3.02":
         return "⚡ LIVE [INSUFFICIENT FUNDS]"
     if "3DS" in str(status).upper() or str(status).lower() in ("3ds_verify","3ds_redirect","3ds_required","challenge_required","redirect","order_status_3ds_verify","order_status_redirect"):
@@ -693,8 +693,8 @@ def run_check(card_number, exp_month, exp_year, cvv, user_id: int = None):
                         ec = te["code"]; em = sanitize_error_message(", ".join(te.get("messages",[]))); break
 
             fo = sr.get("order",{})
-            is_approved = ostatus in ("ORDER_STATUS_APPROVED","approved","ORDER_STATUS_SETTLE_OK","settle_ok","settled")
             is_auth_ok  = ostatus in ("ORDER_STATUS_AUTH_OK", "auth_ok")
+            is_approved = ostatus in ("ORDER_STATUS_APPROVED","approved","ORDER_STATUS_SETTLE_OK","settle_ok","settled") or is_auth_ok
             is_insuff   = (ec == "3.02" or "insufficient" in em.lower())
 
             # 3DS is ONLY true if there is NO decline error code (or it's 3.02) AND 3DS status was returned
@@ -706,7 +706,7 @@ def run_check(card_number, exp_month, exp_year, cvv, user_id: int = None):
 
             if is_approved:
                 stype = "approved"
-            elif is_insuff or is_auth_ok or is_3ds:
+            elif is_insuff or is_3ds:
                 stype = "live"
             else:
                 stype = "declined"
