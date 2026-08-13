@@ -136,7 +136,7 @@ def test_single_proxy(proxy_url: str) -> tuple:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logging.getLogger("aiogram.event").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
-_pool = ThreadPoolExecutor(max_workers=100)
+_pool = ThreadPoolExecutor(max_workers=1000)
 
 # ──────────────────────────────────────────────────────────────
 # PER-USER CHECK LOCK & CANCELLATION STATE
